@@ -1,135 +1,170 @@
-# cronjob-alert
-// TODO(user): Add simple overview of use/purpose
+# Kubernetes CronJob Failure Slack Notifier
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+## Overview
 
-## Getting Started
+This Kubernetes controller monitors `batch/v1.Job` resources within a cluster. When it detects that a Job created and owned by a `batch/v1.CronJob` has failed, it sends a detailed notification to a configured Slack channel. The notification includes information about the CronJob, the failed Job, the Pod, the namespace, and the last 100 lines of logs from the failed Pod to aid in debugging.
 
-### Prerequisites
-- go version v1.23.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+The controller incorporates features like idempotency (to avoid duplicate alerts for the same Job instance), rate limiting (to prevent alert storms from frequently failing CronJobs), and configurable behavior per CronJob.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+Built with [Kubebuilder](https://book.kubebuilder.io/).
 
-```sh
-make docker-build docker-push IMG=<some-registry>/cronjob-alert:tag
+## Features
+
+* **Watches Job Failures:** Monitors `batch/v1.Job` resources across the cluster.
+* **CronJob Focus:** Filters for Jobs specifically owned by `batch/v1.CronJob` resources.
+* **Slack Notifications:** Sends alerts to a designated Slack channel upon failure detection.
+* **Detailed Alerts:** Notifications include CronJob, Job, Pod name, Namespace, and truncated Pod logs.
+* **Pod Log Retrieval:** Fetches the last 100 lines of logs from the failed Job's Pod.
+* **Retry Logic:** Implements exponential backoff when attempting to send Slack messages to handle transient network errors.
+* **Idempotency:** Prevents duplicate notifications for the *exact same Job failure* by annotating processed Jobs (`ctrianta30/slack-notified-failed`).
+* **Rate Limiting:** Prevents alert spam by limiting notifications for failures originating from the *same CronJob* based on a configurable time window.
+    * Tracks the last notification time per CronJob via an annotation (`ctrianta30/last-slack-failure-notification-ts`).
+    * Uses a default rate limit configurable via an environment variable.
+    * Allows overriding the rate limit per CronJob via an annotation (`ctrianta30/notification-rate-limit-minutes`).
+
+## Prerequisites
+
+* Kubernetes Cluster (v1.19+)
+* `kubectl` configured to access the cluster.
+* Docker (for building the container image).
+* `make` (for using the Makefile commands).
+* Go (if modifying the code, check Kubebuilder docs for version compatibility).
+* A Slack Workspace and permission to create/manage Slack Apps.
+
+## Configuration
+
+The controller requires Slack API credentials and configuration for rate limiting.
+
+### 1. Slack Credentials (Kubernetes Secret)
+
+The controller expects a Slack Bot Token and a target Channel ID to be provided via a Kubernetes Secret.
+
+**Slack App Setup:**
+1.  Create a Slack App at [https://api.slack.com/apps](https://api.slack.com/apps).
+2.  Navigate to "OAuth & Permissions".
+3.  Under "Bot Token Scopes", add the `chat:write` scope.
+4.  Install the app to your workspace.
+5.  Copy the "Bot User OAuth Token" (starts with `xoxb-`).
+6.  Identify the Channel ID you want notifications sent to (you can find this in the channel's URL or via other methods).
+
+**Create the Secret:**
+Replace placeholders and run the following command (ensure the namespace matches where you deploy the controller, typically `<project-name>-system` like `cronjob-alerter-system`):
+
+```bash
+kubectl create secret generic slack-credentials \
+  --from-literal=SLACK_BOT_TOKEN='<your-bot-token>' \
+  --from-literal=SLACK_CHANNEL_ID='<your-channel-id>' \
+  -n cronjob-alerter-system # Adjust namespace if needed
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Or create using YAML:
 
-**Install the CRDs into the cluster:**
-
-```sh
-make install
+```
+# slack-credentials.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slack-credentials
+  namespace: cronjob-alert
+type: Opaque
+stringData:
+data:
+  SLACK_BOT_TOKEN: "<base64 token>"
+  SLACK_CHANNEL_ID: "<base64 slack channel id>"
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Apply with `kubectl apply -f slack-credentials.yaml`
 
-```sh
-make deploy IMG=<some-registry>/cronjob-alert:tag
+### 2. Environment Variables
+
+The controller's Deployment mounts the `slack-credentials` secret as environment variables:
+
+- SLACK_BOT_TOKEN: Used to authenticate with the Slack API.
+- SLACK_CHANNEL_ID: The ID of the channel where notifications will be sent.
+
+### 3. CronJob Annotations (Per-CronJob Configuration)
+
+You can customize the rate limiting behavior for individual CronJobs using annotations in their metadata:
+
+- `ctrianta30/notification-rate-limit-minutes`: (Optional) Set this annotation on a CronJob to prevent alert storms from frequently failing CronJobs .
+    - Value must be a string representing a positive integer (e.g., "10" for 10 minutes, "60" for 1 hour).
+    - If the annotation is missing, the controller will send a notification for every failure.
+
+**Example Cronjob**
+
+```
+# cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fail-cronjob-test
+  annotations:
+    ctrianta30/notification-rate-limit-minutes: "2"
+spec:
+  schedule: "*/1 * * * *" # Run every minute for testing
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: fail-container
+            image: busybox
+            command: ["/bin/sh", "-c", "echo 'Simulating failure'; exit 1"]
+          restartPolicy: Never
+      backoffLimit: 1
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+- `ctrianta30/last-slack-failure-notification-ts`: Managed by the controller. This annotation is automatically added/updated by the controller on the CronJob resource to store the timestamp (RFC3339 format) of the last successful Slack notification sent for that CronJob. Users should not set this manually.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+### 4. Job Annotation (Controller Managed)
 
-```sh
-kubectl apply -k config/samples/
+- `ctrianta30/slack-notified-failed`: Managed by the controller. This annotation is added to Job resources after a failure notification has been successfully processed (either sent or skipped due to rate limiting). This prevents the controller from reprocessing the exact same Job instance if a reconcile loop is triggered again for it.
+
+## Deployment
+
+### 1. Build and Push the Image:
+
+```
+# Replace with your container registry path
+export IMG="your-registry/cronjob-alert:latest"
+make docker-build docker-push IMG=$IMG
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+### 2. Create the Slack Secret:
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+Ensure you have created the `slack-credentials` secret in the target namespace as described in the Configuration section.
 
-```sh
-kubectl delete -k config/samples/
+### 3. Deploy the Controller:
+
+This command applies the necessary Custom Resource Definitions (if any were defined, though this controller doesn't strictly need one), RBAC rules (ClusterRole, ClusterRoleBinding), and the Deployment for the controller manager.
+
+```
+make deploy IMG=$IMG
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## RBAC Permissions
 
-```sh
-make uninstall
-```
+The controller requires the following permissions (defined via `//+kubebuilder:rbac` markers and applied by `make deploy`):
 
-**UnDeploy the controller from the cluster:**
+- batch/v1:
+    - Jobs: `get`, `list`, `watch`, `update`, `patch`, `delete`
+    - Jobs/status: `get`, `update`, `patch`
+    - Jobs/finalizers: `update`
+    - CronJobs: `get`, `list`, `watch`, `update`
 
-```sh
-make undeploy
-```
+- core/v1 (""):
+    - Pods: `get`, `list`, `watch`
+    - Pods/log: `get`
+    - Secrets: `get`, `list`, `watch`
+    - Events: `create`, `patch`
 
-## Project Distribution
+- coordination.k8s.io/v1:
+    - Leases: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
 
-Following the options to release and provide this solution to the users.
+## Development
 
-### By providing a bundle with all YAML files
+This controller is built using Kubebuilder v3+.
 
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/cronjob-alert:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/cronjob-alert/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+- **Run Locally**: `make run ENABLE_WEBHOOKS=false` (Requires Go installed and environment variables SLACK_BOT_TOKEN and SLACK_CHANNEL_ID).
+- **Generate Manifests**: `make manifests`
+- **Run Tests**: `make test`

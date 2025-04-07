@@ -53,18 +53,17 @@ const (
 	slackChannelEnvVar = "SLACK_CHANNEL_ID"
 	// OwnerReference Kind for CronJob
 	cronJobKind = "CronJob"
-	// Duration to wait before sending another notification for the same CronJob
-	notificationRateLimitDurationEnvVar = "NOTIFICATION_RATE_LIMIT_DURUATION"
+	// Annotation on the CRONJOB to specify its custom rate limit in minutes
+	cronJobRateLimitAnnotation = "ctrianta30/notification-rate-limit-minutes"
 )
 
 // CronjobAlertReconciler reconciles a CronjobAlert object
 type CronjobAlertReconciler struct {
 	client.Client
-	Scheme                        *runtime.Scheme
-	Config                        *rest.Config
-	SlackClient                   *slack.Client
-	SlackChannel                  string
-	NotificationRateLimitDuration time.Duration
+	Scheme       *runtime.Scheme
+	Config       *rest.Config
+	SlackClient  *slack.Client
+	SlackChannel string
 }
 
 var slackBackoff = wait.Backoff{
@@ -156,36 +155,52 @@ func (r *CronjobAlertReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	} else {
 		// CronJob fetched successfully, proceed with rate limit check
 		cronJobAnnotations := cronJob.GetAnnotations()
-		if lastTimestampStr, exists := cronJobAnnotations[lastSlackNotificationTimestampAnnotation]; exists {
-			// Try parsing the stored timestamp
-			lastTimestamp, err := time.Parse(time.RFC3339, lastTimestampStr)
-			if err != nil {
-				log.Error(err, "Failed to parse last notification timestamp annotation from CronJob", "annotationValue", lastTimestampStr)
-				// Decide how to handle parse error - proceed with notification this time?
-			} else {
-				// Successfully parsed, check the time difference
-				if time.Since(lastTimestamp) < r.NotificationRateLimitDuration {
-					// It's been less than the rate limit duration since the last notification for this CronJob
-					log.Info("Skipping Slack notification due to rate limiting",
-						"cronjob", cronJobNamespacedName,
-						"lastNotification", lastTimestamp,
-						"rateLimit", r.NotificationRateLimitDuration)
+		// Check if Cronjob has the cronJobRateLimitAnnotation annotation
+		cronJobRateLimitAnnotationStr, exists := cronJobAnnotations[cronJobRateLimitAnnotation]
 
-					// *** IMPORTANT ***: Even though we skip Slack, we MUST still annotate the JOB
-					// to prevent this specific Job failure from being re-processed indefinitely.
-					if jobAnnotations == nil {
-						jobAnnotations = make(map[string]string)
+		if exists {
+			cronJobRateLimitAnnotationInt, err := strconv.Atoi(cronJobRateLimitAnnotationStr)
+			if err != nil {
+				log.Error(err, "Failed to parse Notification Rate Limit for cronjob", "cronjob", cronJobNamespacedName)
+			} else if cronJobRateLimitAnnotationInt <= 0 {
+				log.Error(nil, "Invalid Notification Rate Limit for cronjob", "cronjob", cronJobNamespacedName, "RateLimit", cronJobRateLimitAnnotationInt)
+			} else {
+				cronJobRateLimitAnnotationDuration := time.Duration(cronJobRateLimitAnnotationInt) * time.Minute
+				log.Info("Custom Notification Rate Limit has been set.", "cronjob", cronJobNamespacedName, "RateLimit", cronJobRateLimitAnnotationInt)
+				if lastTimestampStr, exists := cronJobAnnotations[lastSlackNotificationTimestampAnnotation]; exists {
+					// Try parsing the stored timestamp
+					lastTimestamp, err := time.Parse(time.RFC3339, lastTimestampStr)
+					if err != nil {
+						log.Error(err, "Failed to parse last notification timestamp annotation from CronJob", "annotationValue", lastTimestampStr)
+						// Decide how to handle parse error - proceed with notification this time?
+					} else {
+						// Successfully parsed, check the time difference
+						if time.Since(lastTimestamp) < cronJobRateLimitAnnotationDuration {
+							// It's been less than the rate limit duration since the last notification for this CronJob
+							log.Info("Skipping Slack notification due to rate limiting",
+								"cronjob", cronJobNamespacedName,
+								"lastNotification", lastTimestamp,
+								"rateLimit", cronJobRateLimitAnnotationDuration)
+
+							// *** IMPORTANT ***: Even though we skip Slack, we MUST still annotate the JOB
+							// to prevent this specific Job failure from being re-processed indefinitely.
+							if jobAnnotations == nil {
+								jobAnnotations = make(map[string]string)
+							}
+							jobAnnotations[slackNotificationAnnotation] = "true"
+							job.SetAnnotations(jobAnnotations)
+							if err := r.Update(ctx, &job); err != nil {
+								log.Error(err, "Failed to update Job annotation after skipping rate-limited notification")
+								return ctrl.Result{}, err
+							}
+							log.Info("Added annotation to Job even though notification was rate-limited.")
+							return ctrl.Result{}, nil
+						}
 					}
-					jobAnnotations[slackNotificationAnnotation] = "true"
-					job.SetAnnotations(jobAnnotations)
-					if err := r.Update(ctx, &job); err != nil {
-						log.Error(err, "Failed to update Job annotation after skipping rate-limited notification")
-						return ctrl.Result{}, err
-					}
-					log.Info("Added annotation to Job even though notification was rate-limited.")
-					return ctrl.Result{}, nil
 				}
 			}
+		} else {
+			log.Info("No Notification Rate Limit has been provided for Cronjob", "cronjob", cronJobNamespacedName)
 		}
 	}
 
@@ -375,17 +390,6 @@ func (r *CronjobAlertReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Get Slack Token and Channel from environment variables
 	slackToken := os.Getenv(slackTokenEnvVar)
 	slackChannel := os.Getenv(slackChannelEnvVar)
-
-	notificationRateLimitDurationStr := os.Getenv(notificationRateLimitDurationEnvVar)
-	notificationRateLimitDurationInt, err := strconv.Atoi(notificationRateLimitDurationStr)
-	if err != nil {
-		// Handle the error appropriately, e.g., log it and use a default value
-		fmt.Fprintf(os.Stderr, "Error converting %s to integer: %v\n", notificationRateLimitDurationEnvVar, err)
-		// Use a default value of 5 minutes
-		r.NotificationRateLimitDuration = 5 * time.Minute
-	} else {
-		r.NotificationRateLimitDuration = time.Duration(notificationRateLimitDurationInt) * time.Minute
-	}
 
 	if slackToken == "" {
 		ctrl.Log.Info("Warning: SLACK_BOT_TOKEN environment variable not set. Slack notifications disabled.")
